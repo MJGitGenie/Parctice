@@ -1,0 +1,259 @@
+def version, shortCommitHash, tag
+def role_name, role_account
+def build_desc, build_type
+def artifacts, artifact, app_env
+
+// global constants
+project    = 'cue2'
+app_name   = 'data-migration'
+region     = 'us-east-1'
+
+// batch
+image        = "data-migration"
+
+//nexus constants
+nexus_flag = false
+nexus_host = 'nexusmaster.ascap.com'
+nexus_port = 18444 // port for docker push
+
+//branch
+main_branch = 'master'
+//main_branch = 'feature/jenkins'
+
+pipeline
+{
+  agent {  label 'worker2' }
+  options
+  {
+    timeout(time: 1, unit: 'HOURS')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timestamps()
+  }
+
+  // TODO: revisit since only dev should be triggered automatically
+  triggers
+  {
+    pollSCM('* * * * *')
+  }
+
+  stages
+  {
+    stage ('Initialize')
+    {
+      agent
+      {
+        docker
+        {
+          label 'worker2'
+          image 'nexusmaster.ascap.com:18443/maven:3-alpine'
+          //args '-v /var/lib/cloudbees-core-cm/.m2:/var/lib/cloudbees-core-cm/.m2'
+        }
+      }
+      steps
+      {
+        // NotifySlack('STARTED')
+        notifyBuild('STARTED')
+        sh '''
+          echo "PATH = ${PATH}"
+          echo "M2_HOME = ${M2_HOME}"
+          echo "APP_ENV = ${APP_ENV}"
+        '''
+      }
+    }
+    
+    stage ('NexusIQ Policy Evaluation')
+    {
+            steps
+            {
+                // notifySlack('STARTED')
+                nexusPolicyEvaluation advancedProperties: '', enableDebugLogging: false, failBuildOnNetworkError: false, iqApplication: selectedApplication('cue2-show-data-migration__ascap'), iqInstanceId: 'NexusIQServer', iqStage: 'source', jobCredentialsId: 'NexusIQuser'
+            }
+        }
+
+    stage ('Sonar Code Analysis')
+    {
+      // tools {
+        //          jdk "jdk8"
+        //      }
+        environment {
+                scannerHome = tool 'sonar-scanner'
+            }
+      steps
+      {
+        withSonarQubeEnv('SonarQube')
+        {
+          sh "${scannerHome}/bin/sonar-scanner -Dproject.settings=./cicd/sonar-project.properties -Dsonar.branch.name=${env.GIT_BRANCH}"
+          sh "./gradlew build"
+        }
+      }
+    }
+
+    stage ('Quality Gate')
+    {
+      steps
+      {
+        script
+        {
+          timeout(time: 1, unit: 'HOURS')
+          {
+            def qg = waitForQualityGate ()
+            if (qg.status != 'OK')
+            {
+              error "Pipeline aborted due to quality gate failure: ${qg.status}"
+            }
+          }
+        }
+      }
+    }
+
+    stage ('Docker Build and Nexus Push')
+    {
+      steps
+      {
+        script
+        {
+          shortCommitHash="${env.GIT_COMMIT}".substring (0,7)
+          echo "shortCommitHash = $shortCommitHash"
+          //version = readFile('version.txt').trim()
+          version = sh (script: "./gradlew -q pV", returnStdout: true).trim()
+          echo "version = $version"
+          tag = "$version-$shortCommitHash"
+          echo "tag = $tag"
+        }
+
+        sh "chmod +x cicd/*.sh"
+        sh './cicd/docker-clean.sh'
+        //Docker build
+        sh "./cicd/docker-build.sh build $tag"
+
+
+        script
+        {
+
+          // Push to Nexus
+          if (env.GIT_BRANCH == main_branch || nexus_flag)
+          {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId:'NexusAdmin',
+            usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']])
+            {
+              sh 'echo uname=$USERNAME pwd=$PASSWORD'
+              sh "docker login -u $USERNAME -p $PASSWORD $nexus_host:$nexus_port"
+              sh "docker tag $project-$image:$tag $nexus_host:$nexus_port/$project/$image:$tag"
+              sh "docker push $nexus_host:$nexus_port/$project/$image:$tag"
+            }
+          }
+          sh "chmod +x cicd/*.sh"
+          sh './cicd/docker-clean.sh'
+        }
+      }
+    }
+
+    // TODO: add stage to clear untagged ecr images and check nexus manifests
+    stage ('Deploy to Dev')
+    {
+      when {
+        branch main_branch
+      }
+      steps
+      {
+        script
+        {
+          deployBatch('cue2/data-migration', "${tag}", '396937132728', 'dev', 'cue2-cicd-devops-dev', true)
+        }
+      }
+    }
+  }
+
+  post
+  {
+    always
+    {
+      deleteDir()
+      // NotifySlack(currentBuild.currentResult)
+      notifyBuild(currentBuild.result)
+    }
+  }
+}
+
+def deployBatch(String image, String tag, String account, String app_env, String role, boolean update_cloudwatch_rule)
+{
+  withCredentials([string(credentialsId: 'rundeck', variable: 'rundeck_token')])
+  {
+    script
+    {
+      def rundeck_api = 'https://rundeckmaster.ascap.com/api/27'
+      def rundeck_job_id = 'c04cf89b-0f21-46de-8dbb-e7081fe0a4ed'
+      def rundeck_payload = [options: [app_env: "${app_env}", docker_image_version: "${tag}", docker_repository_name: "${image}", aws_account: "${account}", aws_role: "${role}", update_cloudwatch_rule: "${update_cloudwatch_rule}"]]
+      def toJson = {input -> groovy.json.JsonOutput.toJson(input)}
+      print "updating batch job with ${image}:${tag}"
+      def response = httpRequest customHeaders: [[name: 'X-Rundeck-Auth-Token', value: rundeck_token]], acceptType: 'APPLICATION_JSON', contentType: 'APPLICATION_JSON', httpMode: 'POST', requestBody: toJson(rundeck_payload), url: "${rundeck_api}/job/${rundeck_job_id}/run"
+      if (response.status != 200)
+      {
+        print readJSON(text: response.content)
+        assert response.status == 200
+      }
+    }
+  }
+}
+
+def NotifySlack(buildStatus)
+{
+    def colorCode = ''
+    if (buildStatus == 'STARTED')
+    {
+        colorCode = '#0000FF' // 'BLUE'
+    } else if (buildStatus == 'SUCCESS')
+    {
+        colorCode = '#00FF00' // 'GREEN'
+    } else
+    {
+        colorCode = '#FF0000' // 'RED'
+    }
+
+   def notificationMessage = "$buildStatus: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})"
+   slackSend (color: colorCode, message: notificationMessage, channel: '#ome-cicd' , tokenCredentialId: 'ome-cicd-slack-token')
+
+}
+
+def notifyBuild(String buildStatus = 'STARTED')
+{
+  // build status of null means successful
+  buildStatus =  buildStatus ?: 'SUCCESSFUL'
+
+  // Default values
+  def colorName = 'RED'
+  def colorCode = '#FF0000'
+  def subject   = "$buildStatus: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+  def summary   = "$subject (${env.BUILD_URL})"
+  def details   = """
+    <p>STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':</p>
+    <p>Check console output at "<a href="${env.BUILD_URL}">${env.JOB_NAME} [${env.BUILD_NUMBER}]</a>"</p>
+  """
+
+  // Override default values based on build status
+  switch(buildStatus)
+  {
+    case 'STARTED':
+      color     = 'YELLOW'
+      colorCode = '#FFFF00'
+      break
+    case 'SUCCESSFUL':
+      color     = 'GREEN'
+      colorCode = '#00FF00'
+      break
+    default:
+      color     = 'RED'
+      colorCode = '#FF0000'
+      break
+  }
+
+  // Send notifications
+  // slackSend (color: colorCode, message: summary)
+  // hipchatSend (color: color, notify: true, message: summary)
+
+  emailext(subject: subject, body: details, recipientProviders: [
+    [$class: 'DevelopersRecipientProvider'],
+    [$class: 'RequesterRecipientProvider']])
+} 
+

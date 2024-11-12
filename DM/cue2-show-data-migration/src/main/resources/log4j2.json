@@ -1,0 +1,41 @@
+{
+  "configuration": {
+    "status": "info",
+    "name": "DMLog",
+    "ThresholdFilter": {
+      "level": "debug"
+    },
+    "appenders": {
+      "Console": {
+        "name": "STDOUT",
+        "PatternLayout": {
+          "pattern": "%d{HH:mm:ss,SSS} [%-5p] %c:%L - %m%n"
+        }
+      }
+    },
+    "loggers": {
+      "root": {
+        "level": "info",
+        "AppenderRef": {
+          "ref": "STDOUT"
+        }
+      },
+      "logger": [
+        {
+          "name": "org.apache.kafka",
+          "level": "warn",
+          "AppenderRef": {
+            "ref": "STDOUT"
+          }
+        },
+        {
+          "name": "io.confluent.kafka",
+          "level": "warn",
+          "AppenderRef": {
+            "ref": "STDOUT"
+          }
+        }
+      ]
+    }
+  }
+}
